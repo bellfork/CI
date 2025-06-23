@@ -1,0 +1,238 @@
+name: Manual Build and Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: 'Repository to checkout'
+        required: true
+        type: choice
+        options:
+          - 'bellfork/tinkerbell'
+          - 'jacobweinstock/tinkerbell'
+          - 'tinkerbell/tinkerbell'
+        default: 'tinkerbell/bellfork'
+      ref:
+        description: 'Git reference (branch, tag, commit hash)'
+        required: true
+        type: string
+        default: 'main'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ghcr.io/${{ github.repository }}
+  CGO_ENABLED: 0
+  GO_VERSION: "1.24"
+
+jobs:
+  validation:
+    runs-on: ubuntu-latest
+    outputs:
+      version-tag: ${{ steps.version.outputs.version-tag }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          fetch-tags: false
+
+      - name: Create version tag from commit hash
+        run: |
+          SHORT_HASH=$(git rev-parse --short HEAD)
+          VERSION_TAG="v0.0.0-${SHORT_HASH}"
+          echo "VERSION_TAG=${VERSION_TAG}" >> $GITHUB_ENV
+          echo "version-tag=${VERSION_TAG}" >> $GITHUB_OUTPUT
+
+          git tag --force "${VERSION_TAG}"
+        id: version
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "${{ env.GO_VERSION }}"
+          cache: false
+
+      - name: Run all CI checks, linting, tests, etc
+        run: make ci TEST_ARGS="-count=1"
+
+      - name: Install helm
+        uses: Azure/setup-helm@v4
+
+      - name: Lint and Template Helm chart
+        run: make helm-lint helm-template
+
+  build-binaries:
+    runs-on: ubuntu-latest
+    needs:
+      - validation
+    strategy:
+      matrix:
+        include:
+          - name: tinkerbell
+            make-target: cross-compile
+            artifact-name: tinkerbell-binaries
+          - name: tink-agent
+            make-target: cross-compile-agent
+            artifact-name: tink-agent-binaries
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          fetch-tags: false
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "${{ env.GO_VERSION }}"
+          cache: false
+
+      - name: Apply and Commit version tag to avoid dirty state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          git diff --staged --quiet || git commit -m "Apply version tag ${{ needs.validation.outputs.version-tag }}"
+          git tag --force "${{ needs.validation.outputs.version-tag }}"
+
+      - name: Compile binaries for ${{ matrix.name }}
+        run: make ${{ matrix.make-target }}
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact-name }}
+          path: |
+            out/${{ matrix.name }}-*
+            ${{ matrix.extra-paths }}
+          if-no-files-found: error
+
+  build-publish-container-images:
+    runs-on: ubuntu-latest
+    needs:
+      - validation
+      - build-binaries
+    strategy:
+      matrix:
+        include:
+          - artifact_name: tinkerbell-binaries
+            image_name: ghcr.io/${{ github.repository_owner }}/tinkerbell
+            make-target: build-push-image
+          - artifact_name: tink-agent-binaries
+            image_name: ghcr.io/${{ github.repository_owner }}/tink-agent
+            make-target: build-push-image-agent
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          fetch-tags: false
+
+      # Add support for more platforms with QEMU (optional)
+      # https://github.com/docker/setup-qemu-action
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.repository_owner }}
+          password: ${{ github.token }}
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ./out
+          merge-multiple: true
+
+      # Artifact upload doesn't preserve permissions so we need to fix them.
+      - name: Fix permissions
+        run: chmod +x out/*
+
+      - name: Apply and Commit version tag to avoid dirty state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          git diff --staged --quiet || git commit -m "Apply version tag ${{ needs.validation.outputs.version-tag }}"
+          git tag --force "${{ needs.validation.outputs.version-tag }}"
+
+      - name: Prepare build environment
+        run: make prepare-buildx
+
+      - name: Build and publish container images
+        run: make ${{ matrix.make-target }}
+        env:
+          IMAGE_NAME: ${{ matrix.image_name }}
+          IMAGE_NAME_AGENT: ${{ matrix.image_name }}
+          VERSION: ${{ needs.validation.outputs.version-tag }}
+
+  package-publish-helm-chart:
+    runs-on: ubuntu-latest
+    needs:
+      - validation
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          fetch-tags: false
+
+      # Go is needed to get the VERSION in the Makefile which is used in the Helm packaging
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "${{ env.GO_VERSION }}"
+          cache: false
+
+      - name: Login to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.repository_owner }}
+          password: ${{ github.token }}
+
+      - name: Install helm
+        uses: Azure/setup-helm@v4
+
+      - name: Patch Helm chart image references
+        run: find helm/tinkerbell/ -name "*.yaml" -o -name "*.yml" | xargs sed -i 's|ghcr\.io/tinkerbell/|ghcr.io/${{ github.repository_owner }}/|g'
+
+      - name: Apply and Commit version tag to avoid dirty state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          git diff --staged --quiet || git commit -m "Apply version tag ${{ needs.validation.outputs.version-tag }}"
+          git tag --force "${{ needs.validation.outputs.version-tag }}"
+
+      - name: Package and publish the Helm chart
+        run: make helm-publish
+        env:
+          HELM_REPO_NAME: ghcr.io/${{ github.repository_owner }}/charts
+          VERSION: ${{ needs.validation.outputs.version-tag }}
+
+  summary:
+    runs-on: ubuntu-latest
+    needs:
+      - validation
+      - build-binaries
+      - build-publish-container-images
+      - package-publish-helm-chart
+    if: always()
+    steps:
+      - name: Add build summary
+        run: |
+          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Repository:** ${{ inputs.repository }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Reference:** ${{ inputs.ref }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version Tag:** ${{ needs.validation.outputs.version-tag }}" >> $GITHUB_STEP_SUMMARY
