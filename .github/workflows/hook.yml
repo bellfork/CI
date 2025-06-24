@@ -1,0 +1,281 @@
+name: Manual Hook Build and Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: 'Repository to checkout'
+        required: true
+        type: choice
+        options:
+          - 'bellfork/hook'
+          - 'jacobweinstock/hook'
+          - 'tinkerbell/hook'
+        default: 'tinkerbell/hook'
+      ref:
+        description: 'Git reference (branch, tag, commit hash)'
+        required: true
+        type: string
+        default: 'main'
+      ci_tags:
+        description: 'Hook flavors to build (space-separated)'
+        required: true
+        type: string
+        default: 'standard'
+
+env:
+  # Registry configuration
+  REGISTRY: "ghcr.io"
+  LOGIN_TO_DOCKERHUB: "yes"
+
+  # Hook version based on run number
+  HOOK_VERSION: "0.10.0-build-${{github.run_number}}"
+
+  # GHA runner configuration
+  CI_RUNNER: "ubuntu-latest"
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+
+  matrix_prep:
+    name: "Prepare matrix JSON"
+    runs-on: ubuntu-latest
+    outputs:
+      version-tag: ${{ steps.version.outputs.version-tag }}
+      created: ${{ steps.date_prep.outputs.created }}
+      kernels_json: ${{ steps.prepare-matrix.outputs.kernels_json }}
+      lkcontainers_json: ${{ steps.prepare-matrix.outputs.lkcontainers_json }}
+      lk_hooks_json: ${{ steps.prepare-matrix.outputs.lk_hooks_json }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          fetch-tags: false
+
+      - name: Create version tag from commit hash
+        run: |
+          SHORT_HASH=$(git rev-parse --short HEAD)
+          VERSION_TAG="v0.10.0-${SHORT_HASH}"
+          echo "VERSION_TAG=${VERSION_TAG}" >> $GITHUB_ENV
+          echo "version-tag=${VERSION_TAG}" >> $GITHUB_OUTPUT
+          git tag --force "${VERSION_TAG}"
+        id: version
+
+      - name: Prepare release ID (current date)
+        id: date_prep
+        run: echo "created=$(date -u +'%Y%m%d-%H%M')" >> "${GITHUB_OUTPUT}"
+
+      - name: Run lint (shellcheck/shellfmt)
+        run: bash build.sh lint
+
+      - name: Run the matrix JSON preparation bash script
+        id: prepare-matrix
+        env:
+          CI_TAGS: ${{ inputs.ci_tags }}
+        run: bash build.sh gha-matrix
+
+  build-linuxkit-containers:
+    needs: [ matrix_prep ]
+    runs-on: "${{ matrix.runner }}"
+    strategy:
+      fail-fast: true
+      matrix:
+        include: ${{ fromJSON(needs.matrix_prep.outputs.lkcontainers_json) }}
+    name: "LinuxKit containers for ${{ matrix.docker_arch }}"
+
+    steps:
+      - name: Checkout build repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          fetch-tags: false
+
+      - name: Apply version tag to avoid dirty state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag --force "${{ needs.matrix_prep.outputs.version-tag }}"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Docker Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: "ghcr.io"
+          username: "${{ github.repository_owner }}"
+          password: "${{ secrets.GITHUB_TOKEN }}"
+
+      - name: Build and Push LinuxKit containers for ${{matrix.docker_arch}}
+        env:
+          DOCKER_ARCH: "${{ matrix.docker_arch }}"
+          DO_PUSH: "yes"
+          HOOK_LK_CONTAINERS_OCI_BASE: "ghcr.io/${{ github.repository_owner }}/"
+        run: bash build.sh linuxkit-containers
+
+  build-kernels:
+    needs: [ matrix_prep ]
+    runs-on: "${{ matrix.runner }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.matrix_prep.outputs.kernels_json) }}
+    name: "Kernel ${{ matrix.kernel }}"
+
+    steps:
+      - name: Checkout build repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          fetch-tags: false
+
+      - name: Apply version tag to avoid dirty state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag --force "${{ needs.matrix_prep.outputs.version-tag }}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Docker Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: "ghcr.io"
+          username: "${{ github.repository_owner }}"
+          password: "${{ secrets.GITHUB_TOKEN }}"
+
+      - name: Build and push Kernel ${{matrix.kernel}} (${{ matrix.arch }})
+        env:
+          DO_PUSH: "yes"
+          HOOK_KERNEL_OCI_BASE: "ghcr.io/${{ github.repository_owner }}/hook-kernel"
+        run: bash build.sh build-kernel "${{ matrix.kernel }}"
+
+  build-hook-ensemble:
+    needs: [ matrix_prep, build-linuxkit-containers, build-kernels ]
+    runs-on: "${{ matrix.runner }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.matrix_prep.outputs.lk_hooks_json) }}
+    name: "Hook ${{ matrix.kernel }}"
+
+    steps:
+      - name: Checkout build repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          fetch-tags: false
+
+      - name: Apply version tag to avoid dirty state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag --force "${{ needs.matrix_prep.outputs.version-tag }}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Docker Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: "ghcr.io"
+          username: "${{ github.repository_owner }}"
+          password: "${{ secrets.GITHUB_TOKEN }}"
+
+      - name: "Build Hook with Kernel ${{matrix.kernel}} (${{ matrix.arch }})"
+        env:
+          DO_BUILD_LK_CONTAINERS: "no"
+          HOOK_KERNEL_OCI_BASE: "ghcr.io/${{ github.repository_owner }}/hook-kernel"
+          HOOK_LK_CONTAINERS_OCI_BASE: "ghcr.io/${{ github.repository_owner }}/"
+        run: bash build.sh build "${{ matrix.kernel }}"
+
+      - name: "Build Hook ISO with Kernel ${{matrix.kernel}} (${{ matrix.arch }}) - cache: ${{matrix.gha_cache}}"
+        if: ${{ matrix.build_iso == 'yes' }}
+        env:
+          DO_BUILD_LK_CONTAINERS: "no"
+          HOOK_KERNEL_OCI_BASE: "ghcr.io/${{ github.repository_owner }}/hook-kernel"
+          HOOK_LK_CONTAINERS_OCI_BASE: "ghcr.io/${{ github.repository_owner }}/"
+        run: bash build.sh build "${{ matrix.kernel }}" LINUXKIT_ISO=yes
+
+      - name: Upload hook artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: "hook-tarball-${{ matrix.kernel }}"
+          path: |
+            out/*.tar.gz
+            out/*.iso
+
+  publish-artifacts:
+    name: Publish Hook Artifacts
+    needs: [ matrix_prep, build-hook-ensemble ]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          fetch-tags: false
+
+      - name: Download built Hook artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "hook-tarball-*"
+          merge-multiple: true
+
+      - name: Generate checksum
+        uses: jmgilman/actions-generate-checksum@v1
+        with:
+          method: sha512
+          patterns: |
+            *.tar.gz
+            *.iso
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Hook Build - ${{ needs.matrix_prep.outputs.version-tag }}"
+          files: |
+            *.tar.gz
+            *.iso
+            checksum.txt
+          fail_on_unmatched_files: true
+          prerelease: true
+          generate_release_notes: false
+          tag_name: ${{ needs.matrix_prep.outputs.version-tag }}
+          draft: false
+
+  summary:
+    name: Summary
+    runs-on: ubuntu-latest
+    needs:
+      - matrix_prep
+      - build-linuxkit-containers
+      - build-kernels
+      - build-hook-ensemble
+      - publish-artifacts
+    if: always()
+
+    steps:
+      - name: Add build summary
+        run: |
+          echo "## Hook Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Repository:** ${{ inputs.repository }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Reference:** ${{ inputs.ref }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version Tag:** ${{ needs.matrix_prep.outputs.version-tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Flavors Built:** ${{ inputs.ci_tags }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Build Date:** ${{ needs.matrix_prep.outputs.created }}" >> $GITHUB_STEP_SUMMARY
